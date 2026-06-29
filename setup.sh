@@ -8,6 +8,8 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${AUR_INSIGHT_BIN_DIR:-$HOME/.local/bin}"
 CONFIG_DIR="$HOME/.config/aur-insight"
 CONFIG_FILE="$CONFIG_DIR/config"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/aur-insight"
+HOOK_FILE="$DATA_DIR/paru-hook.sh"
 
 c_bold=$'\033[1m'; c_cyan=$'\033[36m'; c_dim=$'\033[2m'; c_off=$'\033[0m'
 say() { printf '%saur-insight%s | %s\n' "$c_cyan$c_bold" "$c_off" "$1"; }
@@ -18,6 +20,9 @@ command -v python3 >/dev/null 2>&1 || {
 say "installing the CLI to ${c_bold}${BIN_DIR}/aur-insight${c_off}"
 mkdir -p "$BIN_DIR"
 install -m 755 "$REPO_DIR/aur_insight.py" "$BIN_DIR/aur-insight"
+mkdir -p "$DATA_DIR"
+install -m 644 "$REPO_DIR/paru-hook.sh" "$HOOK_FILE"
+say "installed paru hook to ${c_bold}${HOOK_FILE}${c_off}"
 
 case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
@@ -65,15 +70,32 @@ echo
 printf 'Run aur-insight automatically on every paru install/upgrade? [y/N]: '
 read -r hook || true
 if [ "${hook:-n}" = "y" ] || [ "${hook:-n}" = "Y" ]; then
-    rc="$HOME/.bashrc"; [ -n "${ZSH_VERSION:-}" ] && rc="$HOME/.zshrc"
-    [ -n "${SHELL##*zsh}" ] || rc="$HOME/.zshrc"
-    line="source \"$REPO_DIR/paru-hook.sh\""
-    if grep -qsF "$line" "$rc"; then
-        say "hook already present in $rc"
-    else
-        printf '\n# aur-insight paru hook\n%s\n' "$line" >> "$rc"
-        say "added the hook to ${c_bold}${rc}${c_off} — open a new shell to activate"
-    fi
+    line="source \"$HOOK_FILE\""
+    old_line="source \"$REPO_DIR/paru-hook.sh\""
+    rc_files=""
+
+    case "${SHELL:-}" in
+        *zsh) rc_files="$HOME/.zshrc" ;;
+        *bash) rc_files="$HOME/.bashrc" ;;
+    esac
+    [ -f "$HOME/.zshrc" ] && rc_files="$rc_files $HOME/.zshrc"
+    [ -f "$HOME/.bashrc" ] && rc_files="$rc_files $HOME/.bashrc"
+    [ -n "$rc_files" ] || rc_files="$HOME/.bashrc"
+
+    for rc in $rc_files; do
+        touch "$rc"
+        if grep -qsF "$line" "$rc"; then
+            say "hook already present in $rc"
+        elif grep -qsF "$old_line" "$rc"; then
+            tmp="${rc}.aur-insight.$$"
+            sed "s|$old_line|$line|g" "$rc" > "$tmp" && mv "$tmp" "$rc"
+            say "updated hook path in ${c_bold}${rc}${c_off}"
+        else
+            printf '\n# aur-insight paru hook\n%s\n' "$line" >> "$rc"
+            say "added the hook to ${c_bold}${rc}${c_off}"
+        fi
+    done
+    say "open a new shell, or run: ${c_bold}source \"$HOOK_FILE\"${c_off}"
 fi
 
 echo
