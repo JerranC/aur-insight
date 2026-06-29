@@ -1,0 +1,21 @@
+# aur-insight config — copy to ~/.config/aur-insight/config
+#
+# Any OpenAI-compatible /chat/completions endpoint works. Bring your own key.
+# Environment variables (AUR_INSIGHT_API_KEY / AUR_INSIGHT_ENDPOINT /
+# AUR_INSIGHT_MODEL, or OPENAI_API_KEY) override anything set here.
+
+api_key  = sk-replace-me
+
+# --- pick one provider ---------------------------------------------------
+
+# OpenAI
+endpoint = https://api.openai.com/v1
+model    = gpt-4o-mini
+
+# Anthropic (OpenAI-compatible endpoint)
+# endpoint = https://api.anthropic.com/v1
+# model    = claude-haiku-4-5-20251001
+
+# Local Ollama (no key needed; any non-empty api_key value is fine)
+# endpoint = http://localhost:11434/v1
+# model    = llama3.1
