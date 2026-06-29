@@ -167,6 +167,13 @@ paru's own confirmation prompt — you read the verdict, then paru asks you to
 proceed as usual. The hook runs in `--diff` mode: updates are reviewed as a
 diff, fresh installs as a full `--deep` payload review.
 
+Fish users get a native hook at `~/.config/fish/conf.d/aur-insight.fish`.
+For the current fish session, run:
+
+```fish
+source ~/.local/share/aur-insight/paru-hook.fish
+```
+
 - `export AUR_INSIGHT_OFF=1` — temporarily disable the hook.
 - `export AUR_INSIGHT_DEEP=1` — review the **full** payload every time instead
   of just the diff (slower, more tokens, more thorough).
