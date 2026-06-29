@@ -47,7 +47,7 @@ told it's fine. No fear-mongering.
 ## Install
 
 ```bash
-git clone https://github.com/<you>/aur-insight.git
+git clone https://github.com/JerranC/aur-insight.git
 cd aur-insight
 ./setup.sh
 ```
