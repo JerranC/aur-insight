@@ -78,4 +78,5 @@ fi
 
 echo
 say "done. Try it:  ${c_bold}aur-insight --dry-run firefox-nightly${c_off}"
+say "hook check: ${c_bold}aur-insight-hook-status${c_off} after opening a new shell"
 say "or a real review once your key is set: ${c_bold}aur-insight firefox-nightly${c_off}"

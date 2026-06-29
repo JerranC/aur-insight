@@ -18,11 +18,11 @@
 # Set AUR_INSIGHT_DEEP=1 to always review the FULL payload (not just the diff).
 
 AUR_INSIGHT_BIN="${AUR_INSIGHT_BIN:-aur-insight}"
-[ -n "$AUR_INSIGHT_DEEP" ] && AUR_INSIGHT_MODE="--deep" || AUR_INSIGHT_MODE="--diff"
+[ -n "${AUR_INSIGHT_DEEP:-}" ] && AUR_INSIGHT_MODE="--deep" || AUR_INSIGHT_MODE="--diff"
 
 paru() {
     # Bail out cleanly if disabled or the tool is missing.
-    if [ -n "$AUR_INSIGHT_OFF" ] || ! command -v "$AUR_INSIGHT_BIN" >/dev/null 2>&1; then
+    if [ -n "${AUR_INSIGHT_OFF:-}" ] || ! command -v "$AUR_INSIGHT_BIN" >/dev/null 2>&1; then
         command paru "$@"
         return $?
     fi
@@ -45,4 +45,21 @@ paru() {
 
     # Hand off to the real paru, which runs its own confirmation prompt.
     command paru "$@"
+}
+
+aur-insight-hook-status() {
+    if [ -n "${AUR_INSIGHT_OFF:-}" ]; then
+        echo "aur-insight hook: disabled by AUR_INSIGHT_OFF"
+        return 1
+    fi
+    if ! command -v "$AUR_INSIGHT_BIN" >/dev/null 2>&1; then
+        echo "aur-insight hook: $AUR_INSIGHT_BIN not found on PATH"
+        return 1
+    fi
+    if type paru 2>/dev/null | grep -q "function"; then
+        echo "aur-insight hook: active ($AUR_INSIGHT_MODE, $AUR_INSIGHT_BIN)"
+        return 0
+    fi
+    echo "aur-insight hook: not active in this shell; source paru-hook.sh"
+    return 1
 }

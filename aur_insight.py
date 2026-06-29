@@ -807,6 +807,58 @@ def build_user_message(data, is_update):
     return "\n".join(parts)
 
 
+def _line_count(text):
+    return len((text or "").splitlines())
+
+
+def dry_run_summary(data, is_update, deep=False):
+    """Human-sized preview for --dry-run. The raw model prompt is intentionally
+    hidden behind --dump-prompt because diffs and source samples can be huge."""
+    meta = data["meta"]
+    mode = "diff" if data.get("diff_against") else ("deep" if deep else "standard")
+    lines = [
+        "# ===== {0} =====".format(data["name"]),
+        "mode: {0}".format(mode),
+        "pkgbase: {0}".format(data["pkgbase"]),
+        "version: {0}".format(meta.get("Version", "?")),
+        "maintainer: {0}".format(meta.get("Maintainer") or "NONE (orphaned)"),
+        "votes/popularity: {0}/{1}".format(
+            meta.get("NumVotes", 0), round(meta.get("Popularity", 0) or 0, 3)),
+        "pkgbuild: {0} lines".format(_line_count(data.get("pkgbuild"))),
+    ]
+
+    if data["installs"]:
+        lines.append("install hooks: " + ", ".join(sorted(data["installs"])))
+    else:
+        lines.append("install hooks: none")
+
+    if data.get("extras"):
+        lines.append("repo files: " + ", ".join(sorted(data["extras"])))
+    else:
+        lines.append("repo files: none")
+
+    if data.get("diff_against"):
+        lines.append("diff against installed: {0}".format(data["diff_against"]))
+        lines.append("packaging diff: {0} lines".format(
+            _line_count(data.get("ver_pkg_diff"))))
+        lines.append("source build-script diff: {0} lines".format(
+            _line_count(data.get("ver_src_diff"))))
+        for note in data.get("ver_notes", []):
+            lines.append("note: " + note)
+    elif is_update:
+        lines.append("recent packaging diff: {0} lines".format(
+            _line_count(data.get("diff"))))
+
+    if deep and not data.get("diff_against"):
+        lines.append("upstream build files sampled: {0}".format(
+            data.get("deep_count", 0)))
+        for note in data.get("deep_notes", []):
+            lines.append("note: " + note)
+
+    lines.append("raw prompt: use --dump-prompt to print the full LLM input")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # LLM call + verdict parsing
 # ---------------------------------------------------------------------------
@@ -1000,7 +1052,11 @@ def main(argv=None):
     parser.add_argument("--no-cache", action="store_true",
                         help="ignore any cached verdict and re-analyze")
     parser.add_argument("--dry-run", action="store_true",
-                        help="print what would be sent to the LLM, then stop")
+                        help="fetch package data and print a compact preview, "
+                             "then stop without calling the LLM")
+    parser.add_argument("--dump-prompt", action="store_true",
+                        help="print the full raw prompt that would be sent to "
+                             "the LLM, then stop")
     args = parser.parse_args(argv)
 
     # --diff implies a deep fallback: if there's no installed version to diff
@@ -1020,14 +1076,17 @@ def main(argv=None):
                 if args.diff else {})
         pairs = [(p, olds.get(p)) for p in args.packages]
 
-    if args.dry_run:
+    if args.dry_run or args.dump_prompt:
         for pkg, old in pairs:
             data = gather(pkg, deep=deep, old_version=old if args.diff else None)
             if data is None:
                 print("# {0}: not on the AUR".format(pkg))
                 continue
-            print("# ===== {0} =====".format(pkg))
-            print(build_user_message(data, is_update))
+            if args.dump_prompt:
+                print("# ===== {0} =====".format(pkg))
+                print(build_user_message(data, is_update))
+            else:
+                print(dry_run_summary(data, is_update, deep=deep))
             print()
         return 0
 
