@@ -94,6 +94,7 @@ aur-insight firefox-nightly          # review one package's packaging
 aur-insight pkg-a pkg-b pkg-c        # review several
 aur-insight --syu                    # review every pending AUR update (uses paru -Qua)
 aur-insight --deep firefox-nightly   # ALSO download and review the upstream source payload
+aur-insight --diff --syu             # for updates: review ONLY what changed since installed
 aur-insight --install foo            # review, then offer to run `paru -S foo`
 aur-insight --dry-run foo            # show exactly what would be sent to the LLM, spend nothing
 aur-insight --no-cache foo           # ignore the cached verdict and re-analyze
@@ -102,12 +103,13 @@ aur-insight --no-cache foo           # ignore the cached verdict and re-analyze
 Exit code is `1` if anything came back **HIGH RISK**, `0` otherwise — handy for
 scripts and hooks.
 
-### Two depths of review
+### Three depths of review
 
-| Mode             | Reads                                                        | Catches                                              |
-|------------------|-------------------------------------------------------------|-----------------------------------------------------|
-| default          | PKGBUILD, `.install` hooks, repo files (patches), metadata  | malicious **packaging** — bad maintainer, evil hooks |
-| `--deep`         | all of the above **+ the real `source=` payload's build/install scripts** | malicious **code** in a clean-looking package (the xz-utils pattern) |
+| Mode       | Reads                                                              | Catches                                              |
+|------------|-------------------------------------------------------------------|-----------------------------------------------------|
+| default    | PKGBUILD, `.install` hooks, repo files (patches), metadata        | malicious **packaging** — bad maintainer, evil hooks |
+| `--deep`   | all of the above **+ the real `source=` payload's build/install scripts** | malicious **code** in a clean-looking package (xz pattern) |
+| `--diff`   | the **delta** since your installed version — packaging diff **+ source build-script diff** | a package that was clean last version and **turned malicious in an update** |
 
 `--deep` downloads each source, reads it **in memory** (no extraction to disk,
 so a hostile archive can't traverse paths), and samples the files that actually
@@ -116,6 +118,14 @@ execute at build/install time — `configure`, `Makefile`, `*.sh`, `setup.py`,
 It's bounded hard: a 30 MB download cap, 25 files, ~45 KB of code to the model.
 Archives stdlib can't open (e.g. `.zst`) and `hg`/`svn`/`bzr` sources are
 skipped with a note rather than silently ignored.
+
+`--diff` is the update-aware mode. It figures out the version you already have
+(`pacman -Q`, or paru's update list), pulls the **packaging diff** between the
+two AUR commits and the **build-script diff** between the two source payloads,
+and asks the model to focus on what changed — because a previously-trusted
+package quietly growing a malicious build step is the realistic attack. On a
+**fresh** install there's nothing to diff against, so `--diff` automatically
+falls back to a full `--deep` review. This is what the paru hook uses by default.
 
 ### Caching
 
@@ -134,14 +144,20 @@ echo 'source /path/to/aur-insight/paru-hook.sh' >> ~/.bashrc   # or ~/.zshrc
 
 Now `paru -S <pkg>` and `paru -Syu` print an aur-insight verdict **before**
 paru's own confirmation prompt — you read the verdict, then paru asks you to
-proceed as usual. Toggle it off any time with `export AUR_INSIGHT_OFF=1`.
+proceed as usual. The hook runs in `--diff` mode: updates are reviewed as a
+diff, fresh installs as a full `--deep` payload review.
+
+- `export AUR_INSIGHT_OFF=1` — temporarily disable the hook.
+- `export AUR_INSIGHT_DEEP=1` — review the **full** payload every time instead
+  of just the diff (slower, more tokens, more thorough).
 
 ## Privacy & scope
 
 - Everything runs on your machine. The only outbound calls are to the public
   AUR (to fetch PKGBUILDs/metadata) and to the LLM endpoint **you** configure.
-- v1 reviews PKGBUILDs, `.install` hooks, recent diffs, and AUR metadata. It
-  does **not** do binary analysis, non-AUR packages, or hosted backends.
+- Reviews packaging (PKGBUILD, `.install`, repo files, metadata), and with
+  `--deep`/`--diff` the upstream source build scripts. It does **not** do binary
+  analysis, non-AUR packages, or hosted backends.
 - **Ownership-transfer detection** works with no auth: aur-insight reads the
   package's commit history from the AUR's cgit atom feed and flags when the
   committing identity last changed — the classic supply-chain risk window.
@@ -156,9 +172,12 @@ proceed as usual. Toggle it off any time with `export AUR_INSIGHT_OFF=1`.
   giant source tree can still slip past. A clean `--deep` verdict means "nothing
   obviously wrong in the packaging or the build scripts we sampled," not "this
   code is proven safe."
-- **Still out of scope:** binary analysis of `-bin` packages, non-AUR
-  packages, and per-version source *diffing* (only the current payload is
-  reviewed today, not the delta from the version you already trust).
+- **Version diffing** (`--diff`) reviews the delta between your installed
+  version and the update — the strongest check for "was this quietly backdoored
+  in an update?" It diffs build scripts, not every source file, and only works
+  when the source URL carries the version (so the old payload is reconstructable).
+- **Still out of scope:** binary analysis of `-bin` packages and non-AUR
+  packages.
 - It's an assistant, not an authority. A clean verdict is not a guarantee, and
   the final call is always yours.
 

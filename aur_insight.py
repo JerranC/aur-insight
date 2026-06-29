@@ -14,6 +14,7 @@ MIT licensed.
 
 import argparse
 import calendar
+import difflib
 import hashlib
 import io
 import json
@@ -102,6 +103,12 @@ Review it for backdoors, obfuscated or base64/hex-encoded blobs, code that \
 phones home, or anything that does not belong in a build script — this is \
 where supply-chain backdoors like xz-utils hide. If that section is ABSENT, \
 do not assume the payload is safe; make clear you reviewed only the packaging.
+- if you are shown "CHANGES SINCE <version>" sections, the user already ran \
+the previous version and is updating. Focus on the delta: flag newly added \
+network calls, package-manager invocations, download-and-execute steps, \
+obfuscation, or new install hooks even when small — a previously-trusted \
+package turning malicious in an update is the central supply-chain risk. \
+Unchanged, boring diffs are reassuring; say so.
 
 Be proportionate. Most packages are fine; do not invent danger. A clean, \
 boring PKGBUILD from an official source with present checksums is LOW risk and \
@@ -352,6 +359,7 @@ def _classify_source(raw, vmap):
     is_remote = bool(vcs) or re.match(r"(https?|ftp|git)://", resolved)
     return {
         "raw": raw, "name": name and expand_vars(name, vmap),
+        "template": spec,  # unexpanded, so we can re-resolve for another version
         "url": resolved if is_remote else None,
         "local": None if is_remote else resolved,
         "vcs": vcs, "frag": expand_vars(frag, vmap),
@@ -500,10 +508,86 @@ def deep_source_analysis(pkgbuild, pkgbase, meta):
     return "\n\n".join(picked), notes, len(picked)
 
 
+# ---------------------------------------------------------------------------
+# Version diffing — what changed since the version you already trust
+# ---------------------------------------------------------------------------
+
+def packaging_version_diff(pkgbase, history, old_version):
+    """Unified diff of PKGBUILD/.SRCINFO/etc. between the commit that set
+    old_version and the newest commit, via cgit's plain patch-range endpoint.
+    Falls back to the latest single patch if the old commit can't be pinned."""
+    new_sha = history[0].get("sha") if history else None
+    old_sha = None
+    for c in history:
+        if old_version and old_version in c.get("title", ""):
+            old_sha = c.get("sha")
+            break
+    if new_sha and old_sha and new_sha != old_sha:
+        diff = http_get("{0}/patch/?h={1}&id={2}&id2={3}".format(
+            CGIT, urllib.parse.quote(pkgbase), new_sha, old_sha))
+        return (diff, None) if diff else ("", "packaging diff range unavailable")
+    latest = http_get("{0}/patch/?h={1}".format(CGIT, urllib.parse.quote(pkgbase)))
+    return (latest or "",
+            "old version not pinned in recent history; showing latest patch only")
+
+
+def _build_files_map(blob):
+    """{normalized_path: text} of build/install files in an archive, with the
+    version-bearing top directory stripped so the two versions line up."""
+    out = {}
+    for path, data in _read_archive(blob):
+        norm = path.split("/", 1)[1] if "/" in path else path
+        if norm and _is_build_file(norm) and _looks_text(data):
+            out[norm] = data.decode("utf-8", "replace")
+    return out
+
+
+def source_build_diff(pkgbuild, pkgbase, meta, old_version):
+    """Download the old and new source payloads and diff their build/install
+    scripts. The headline check: a package that was clean last version and
+    grew a malicious build step in this one shows up right here."""
+    new_vmap = pkgbuild_vars(pkgbuild, pkgbase, meta)
+    old_vmap = dict(new_vmap, pkgver=old_version)
+    chunks, notes, total = [], [], 0
+    for s in parse_sources(pkgbuild, new_vmap):
+        if not s["url"] or s["vcs"] or s["unresolved"]:
+            continue
+        label = s["name"] or s["url"].rsplit("/", 1)[-1]
+        new_url = expand_vars(s["template"], new_vmap)
+        old_url = expand_vars(s["template"], old_vmap)
+        if old_url == new_url:
+            notes.append("{0}: URL has no version component — can't isolate the "
+                         "change (use --deep)".format(label))
+            continue
+        new_blob, old_blob = _download_capped(new_url), _download_capped(old_url)
+        if not new_blob or not old_blob:
+            notes.append("{0}: couldn't fetch both versions to diff".format(label))
+            continue
+        new_map, old_map = _build_files_map(new_blob), _build_files_map(old_blob)
+        changed = 0
+        for path in sorted(set(new_map) | set(old_map)):
+            if total >= MAX_DEEP_TOTAL_CHARS:
+                break
+            old_lines = old_map.get(path, "").splitlines()
+            new_lines = new_map.get(path, "").splitlines()
+            if old_lines == new_lines:
+                continue
+            ud = list(difflib.unified_diff(
+                old_lines, new_lines, fromfile="old/" + path,
+                tofile="new/" + path, lineterm=""))
+            text = "\n".join(ud[:400])[:MAX_DEEP_FILE_CHARS]
+            chunks.append(text)
+            total += len(text)
+            changed += 1
+        if not changed and (new_map or old_map):
+            notes.append("{0}: build scripts unchanged between versions".format(label))
+    return "\n\n".join(chunks), notes
+
+
 def fetch_history(pkgbase):
     """Recent commits to the AUR packaging repo, newest first, from the cgit
-    atom feed. Each entry is {author, date, title}. Drives ownership-transfer
-    detection without needing an authenticated session."""
+    atom feed. Each entry is {author, date, title, sha}. Drives ownership-
+    transfer detection and version diffing without an authenticated session."""
     raw = http_get("{0}/atom/?h={1}".format(CGIT, urllib.parse.quote(pkgbase)))
     if not raw:
         return []
@@ -512,11 +596,13 @@ def fetch_history(pkgbase):
         name = re.search(r"<name>(.*?)</name>", entry, re.S)
         date = re.search(r"<updated>(.*?)</updated>", entry, re.S)
         title = re.search(r"<title>(.*?)</title>", entry, re.S)
+        sha = re.search(r"id=([a-f0-9]{40})", entry)
         if name and date:
             commits.append({
                 "author": name.group(1).strip(),
                 "date": date.group(1).strip(),
                 "title": title.group(1).strip() if title else "",
+                "sha": sha.group(1) if sha else None,
             })
     return commits
 
@@ -538,10 +624,11 @@ def fetch_account_age(username):
     return m.group(1) if m else None
 
 
-def gather(pkgname, deep=False):
-    """Collect everything we know about a package. Returns a dict or None
-    if the package doesn't exist on the AUR. With deep=True, also downloads
-    and samples the real upstream source payload."""
+def gather(pkgname, deep=False, old_version=None):
+    """Collect everything we know about a package. Returns a dict or None if
+    the package doesn't exist on the AUR. If old_version is given and differs
+    from the new version, produces targeted version diffs (packaging + source
+    build scripts); otherwise deep=True downloads and samples the full payload."""
     meta = fetch_metadata(pkgname)
     if meta is None:
         return None
@@ -566,9 +653,20 @@ def gather(pkgname, deep=False):
                 extras[name] = body
 
     diff = http_get("{0}/patch/?h={1}".format(CGIT, urllib.parse.quote(pkgbase)))
+    history = fetch_history(pkgbase)
 
+    new_version = pkgbuild_vars(pkgbuild, pkgbase, meta).get("pkgver")
+    do_diff = bool(old_version and new_version and old_version != new_version)
+
+    ver_pkg_diff, ver_src_diff, ver_notes = "", "", []
     deep_artifact, deep_notes, deep_count = "", [], 0
-    if deep:
+    if do_diff:
+        ver_pkg_diff, pnote = packaging_version_diff(pkgbase, history, old_version)
+        ver_src_diff, ver_notes = source_build_diff(
+            pkgbuild, pkgbase, meta, old_version)
+        if pnote:
+            ver_notes = [pnote] + ver_notes
+    elif deep:
         deep_artifact, deep_notes, deep_count = deep_source_analysis(
             pkgbuild, pkgbase, meta)
 
@@ -580,11 +678,15 @@ def gather(pkgname, deep=False):
         "installs": installs,
         "extras": extras,
         "diff": diff or "",
-        "history": fetch_history(pkgbase),
+        "history": history,
         "account_age": fetch_account_age(meta.get("Maintainer")),
         "deep_artifact": deep_artifact,
         "deep_notes": deep_notes,
         "deep_count": deep_count,
+        "diff_against": old_version if do_diff else None,
+        "ver_pkg_diff": ver_pkg_diff,
+        "ver_src_diff": ver_src_diff,
+        "ver_notes": ver_notes,
     }
 
 
@@ -676,7 +778,19 @@ def build_user_message(data, is_update):
     for name, body in data.get("extras", {}).items():
         parts.append("\n== REPO FILE: {0} ==\n{1}".format(name, trim(body)))
 
-    if is_update and data["diff"]:
+    if data.get("diff_against"):
+        old = data["diff_against"]
+        parts.append("\n== PACKAGING CHANGES SINCE {0} ==\n{1}".format(
+            old, trim(data.get("ver_pkg_diff") or "(no packaging changes)")))
+        parts.append(
+            "\n== SOURCE BUILD-SCRIPT CHANGES SINCE {0} ==\nDiff of build/"
+            "install-time files in the actual source payload between the "
+            "version installed and the new one. Scrutinize anything newly "
+            "added.\n{1}".format(
+                old, trim(data.get("ver_src_diff") or "(no build-script changes)")))
+        for note in data.get("ver_notes", []):
+            parts.append("note: " + note)
+    elif is_update and data["diff"]:
         parts.append("\n== MOST RECENT PACKAGING DIFF ==\n" + trim(data["diff"]))
 
     if data.get("deep_artifact"):
@@ -781,11 +895,11 @@ def render(result, cached=False):
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def analyze_one(cfg, pkgname, is_update=False, deep=False, use_cache=True):
+def analyze_one(cfg, pkgname, is_update=False, deep=False, old_version=None,
+                use_cache=True):
     """Returns the verdict string, or None if the package wasn't analyzable."""
-    suffix = " {0}(deep){1}".format(C.DIM, C.RESET) if deep else ""
-    banner("analyzing {0}{1}{2}...{3}".format(C.BOLD, pkgname, C.RESET, suffix))
-    data = gather(pkgname, deep=deep)
+    banner("analyzing {0}{1}{2}...".format(C.BOLD, pkgname, C.RESET))
+    data = gather(pkgname, deep=deep, old_version=old_version)
     if data is None:
         print("  {0}not found on the AUR — skipping (is it a repo package?)"
               "{1}".format(C.YELLOW, C.RESET))
@@ -794,6 +908,13 @@ def analyze_one(cfg, pkgname, is_update=False, deep=False, use_cache=True):
         print("  {0}could not fetch PKGBUILD — skipping{1}".format(
             C.YELLOW, C.RESET))
         return None
+
+    if data.get("diff_against"):
+        print("  {0}update {1} -> {2}; reviewing what changed{3}".format(
+            C.DIM, data["diff_against"], data["meta"].get("Version", "?"), C.RESET))
+    elif deep:
+        print("  {0}reviewing upstream source payload (deep){1}".format(
+            C.DIM, C.RESET))
 
     message = build_user_message(data, is_update)
     key = cache_key(cfg, message)
@@ -810,19 +931,39 @@ def analyze_one(cfg, pkgname, is_update=False, deep=False, use_cache=True):
     return result["verdict"]
 
 
+def _clean_pkgver(version):
+    """Strip epoch and pkgrel: '1:12.0.2-3' -> '12.0.2' (matches source URLs)."""
+    if ":" in version:
+        version = version.split(":", 1)[1]
+    return version.rsplit("-", 1)[0]
+
+
+def pacman_version(pkgname):
+    """Installed pkgver of a package, or None if not installed / no pacman."""
+    try:
+        out = subprocess.run(["pacman", "-Q", pkgname], capture_output=True,
+                             text=True, timeout=30)
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+    parts = out.stdout.split()
+    return _clean_pkgver(parts[1]) if out.returncode == 0 and len(parts) > 1 else None
+
+
 def pending_aur_updates():
-    """Ask paru for the list of AUR packages with pending updates."""
+    """AUR packages with pending updates as (name, old_version) pairs, parsed
+    from `paru -Qua` lines like 'pkg 1.0-1 -> 1.1-1'."""
     try:
         out = subprocess.run(["paru", "-Qua"], capture_output=True,
                              text=True, timeout=120)
     except (FileNotFoundError, subprocess.SubprocessError):
         die("could not run `paru -Qua` — is paru installed and on PATH?")
-    names = []
+    pairs = []
     for line in out.stdout.splitlines():
-        line = line.strip()
-        if line and not line.startswith(":"):
-            names.append(line.split()[0])
-    return names
+        parts = line.split()
+        if parts and not line.startswith(":"):
+            old = _clean_pkgver(parts[1]) if len(parts) > 1 else None
+            pairs.append((parts[0], old))
+    return pairs
 
 
 def confirm(prompt):
@@ -852,20 +993,41 @@ def main(argv=None):
     parser.add_argument("--deep", action="store_true",
                         help="also download and review the upstream source "
                              "payload, not just the packaging (slower, more tokens)")
+    parser.add_argument("--diff", action="store_true",
+                        help="for updates, review only what changed since the "
+                             "installed version (packaging + source build scripts); "
+                             "falls back to --deep for fresh installs")
     parser.add_argument("--no-cache", action="store_true",
                         help="ignore any cached verdict and re-analyze")
     parser.add_argument("--dry-run", action="store_true",
                         help="print what would be sent to the LLM, then stop")
     args = parser.parse_args(argv)
 
+    # --diff implies a deep fallback: if there's no installed version to diff
+    # against (a fresh install), review the full payload instead.
+    deep = args.deep or args.diff
+
+    # Resolve targets to (name, old_version) — old_version drives diff mode.
+    if args.syu:
+        pairs = pending_aur_updates()
+        is_update = True
+    else:
+        if not args.packages and not args.dry_run:
+            parser.print_help()
+            return 2
+        is_update = args.update or args.diff
+        olds = ({p: pacman_version(p) for p in args.packages}
+                if args.diff else {})
+        pairs = [(p, olds.get(p)) for p in args.packages]
+
     if args.dry_run:
-        for pkg in (pending_aur_updates() if args.syu else args.packages):
-            data = gather(pkg, deep=args.deep)
+        for pkg, old in pairs:
+            data = gather(pkg, deep=deep, old_version=old if args.diff else None)
             if data is None:
                 print("# {0}: not on the AUR".format(pkg))
                 continue
             print("# ===== {0} =====".format(pkg))
-            print(build_user_message(data, args.syu or args.update))
+            print(build_user_message(data, is_update))
             print()
         return 0
 
@@ -874,25 +1036,19 @@ def main(argv=None):
         die("no API key configured. Set AUR_INSIGHT_API_KEY (or OPENAI_API_KEY) "
             "or add `api_key = ...` to ~/.config/aur-insight/config")
 
+    if args.syu and not pairs:
+        banner("no pending AUR updates to analyze.")
+        return 0
     if args.syu:
-        targets = pending_aur_updates()
-        if not targets:
-            banner("no pending AUR updates to analyze.")
-            return 0
         banner("{0} AUR update(s) to review: {1}".format(
-            len(targets), ", ".join(targets)))
-        is_update = True
-    else:
-        targets = args.packages
-        is_update = args.update
-        if not targets:
-            parser.print_help()
-            return 2
+            len(pairs), ", ".join(n for n, _ in pairs)))
 
+    targets = [n for n, _ in pairs]
     verdicts = {}
-    for pkg in targets:
-        verdicts[pkg] = analyze_one(cfg, pkg, is_update=is_update,
-                                    deep=args.deep, use_cache=not args.no_cache)
+    for pkg, old in pairs:
+        verdicts[pkg] = analyze_one(
+            cfg, pkg, is_update=is_update, deep=deep,
+            old_version=old if args.diff else None, use_cache=not args.no_cache)
         print()
 
     if args.install and targets:
