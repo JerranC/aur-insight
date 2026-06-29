@@ -56,6 +56,23 @@ cd aur-insight
 model slug, and key (stored `0600`), and optionally wires up the paru hook.
 Requires Python 3.6+ and nothing else — standard library only, one file.
 
+Already installed? Upgrade in place without re-entering your API key:
+
+```bash
+git pull
+./setup.sh --upgrade
+exec "$SHELL" -l
+```
+
+To uninstall the CLI and shell hook while keeping your config:
+
+```bash
+./setup.sh --uninstall
+```
+
+Add `--purge-config` to also remove `~/.config/aur-insight` and the local
+cache.
+
 Prefer to do it by hand? It's just:
 
 ```bash

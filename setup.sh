@@ -17,12 +17,127 @@ say() { printf '%saur-insight%s | %s\n' "$c_cyan$c_bold" "$c_off" "$1"; }
 command -v python3 >/dev/null 2>&1 || {
     echo "python3 is required but not found on PATH." >&2; exit 1; }
 
-say "installing the CLI to ${c_bold}${BIN_DIR}/aur-insight${c_off}"
-mkdir -p "$BIN_DIR"
-install -m 755 "$REPO_DIR/aur_insight.py" "$BIN_DIR/aur-insight"
-mkdir -p "$DATA_DIR"
-install -m 644 "$REPO_DIR/paru-hook.sh" "$HOOK_FILE"
-say "installed paru hook to ${c_bold}${HOOK_FILE}${c_off}"
+usage() {
+    cat <<EOF
+usage: ./setup.sh [--upgrade|--uninstall|--purge-config]
+
+  no args        interactive install/reinstall
+  --upgrade      update the CLI + hook file, keep existing config
+  --uninstall    remove the CLI + shell hook, keep config/cache
+  --purge-config remove config and cache too (only with --uninstall)
+EOF
+}
+
+rc_files() {
+    local files=""
+    case "${SHELL:-}" in
+        *zsh) files="$HOME/.zshrc" ;;
+        *bash) files="$HOME/.bashrc" ;;
+    esac
+    [ -f "$HOME/.zshrc" ] && files="$files $HOME/.zshrc"
+    [ -f "$HOME/.bashrc" ] && files="$files $HOME/.bashrc"
+    [ -n "$files" ] || files="$HOME/.bashrc"
+    printf '%s\n' $files | awk '!seen[$0]++'
+}
+
+install_files() {
+    say "installing the CLI to ${c_bold}${BIN_DIR}/aur-insight${c_off}"
+    mkdir -p "$BIN_DIR"
+    install -m 755 "$REPO_DIR/aur_insight.py" "$BIN_DIR/aur-insight"
+    mkdir -p "$DATA_DIR"
+    install -m 644 "$REPO_DIR/paru-hook.sh" "$HOOK_FILE"
+    say "installed paru hook to ${c_bold}${HOOK_FILE}${c_off}"
+}
+
+migrate_hook_paths() {
+    local line old_line rc tmp
+    line="source \"$HOOK_FILE\""
+    old_line="source \"$REPO_DIR/paru-hook.sh\""
+
+    while IFS= read -r rc; do
+        [ -f "$rc" ] || continue
+        if grep -qsF "$line" "$rc"; then
+            say "hook already present in $rc"
+        elif grep -qsF "$old_line" "$rc"; then
+            tmp="${rc}.aur-insight.$$"
+            sed "s|$old_line|$line|g" "$rc" > "$tmp" && mv "$tmp" "$rc"
+            say "updated hook path in ${c_bold}${rc}${c_off}"
+        elif grep -qsE '^[[:space:]]*source .*paru-hook[.]sh' "$rc"; then
+            tmp="${rc}.aur-insight.$$"
+            sed -E "s|^[[:space:]]*source .*paru-hook[.]sh.*$|$line|g" "$rc" > "$tmp" && mv "$tmp" "$rc"
+            say "migrated existing paru hook in ${c_bold}${rc}${c_off}"
+        fi
+    done < <(rc_files)
+}
+
+add_hook_to_rcs() {
+    local line rc
+    line="source \"$HOOK_FILE\""
+    migrate_hook_paths
+
+    while IFS= read -r rc; do
+        touch "$rc"
+        if grep -qsF "$line" "$rc"; then
+            continue
+        fi
+        printf '\n# aur-insight paru hook\n%s\n' "$line" >> "$rc"
+        say "added the hook to ${c_bold}${rc}${c_off}"
+    done < <(rc_files)
+}
+
+remove_hook_from_rcs() {
+    local rc tmp
+    while IFS= read -r rc; do
+        [ -f "$rc" ] || continue
+        tmp="${rc}.aur-insight.$$"
+        sed -E '/# aur-insight paru hook/d;/^[[:space:]]*source .*paru-hook[.]sh/d' "$rc" > "$tmp" && mv "$tmp" "$rc"
+        say "removed paru hook lines from ${c_bold}${rc}${c_off}"
+    done < <(rc_files)
+}
+
+purge_config=0
+case "${1:-}" in
+    --help|-h)
+        usage
+        exit 0
+        ;;
+    --purge-config)
+        echo "--purge-config must be used with --uninstall." >&2
+        usage
+        exit 2
+        ;;
+    --uninstall)
+        [ "${2:-}" = "--purge-config" ] && purge_config=1
+        [ -z "${3:-}" ] || { usage >&2; exit 2; }
+        remove_hook_from_rcs
+        rm -f "$BIN_DIR/aur-insight" "$HOOK_FILE"
+        rmdir "$DATA_DIR" 2>/dev/null || true
+        say "removed CLI and paru hook"
+        if [ "$purge_config" -eq 1 ]; then
+            rm -rf "$CONFIG_DIR" "${XDG_CACHE_HOME:-$HOME/.cache}/aur-insight"
+            say "removed config and cache"
+        else
+            say "kept config at ${c_bold}${CONFIG_FILE}${c_off}"
+        fi
+        exit 0
+        ;;
+    --upgrade)
+        [ -z "${2:-}" ] || { usage >&2; exit 2; }
+        install_files
+        migrate_hook_paths
+        say "upgrade complete; kept existing config at ${c_bold}${CONFIG_FILE}${c_off}"
+        say "open a new shell, or run: ${c_bold}source \"$HOOK_FILE\"${c_off}"
+        exit 0
+        ;;
+    "")
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac
+
+install_files
 
 case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
@@ -70,31 +185,7 @@ echo
 printf 'Run aur-insight automatically on every paru install/upgrade? [y/N]: '
 read -r hook || true
 if [ "${hook:-n}" = "y" ] || [ "${hook:-n}" = "Y" ]; then
-    line="source \"$HOOK_FILE\""
-    old_line="source \"$REPO_DIR/paru-hook.sh\""
-    rc_files=""
-
-    case "${SHELL:-}" in
-        *zsh) rc_files="$HOME/.zshrc" ;;
-        *bash) rc_files="$HOME/.bashrc" ;;
-    esac
-    [ -f "$HOME/.zshrc" ] && rc_files="$rc_files $HOME/.zshrc"
-    [ -f "$HOME/.bashrc" ] && rc_files="$rc_files $HOME/.bashrc"
-    [ -n "$rc_files" ] || rc_files="$HOME/.bashrc"
-
-    for rc in $rc_files; do
-        touch "$rc"
-        if grep -qsF "$line" "$rc"; then
-            say "hook already present in $rc"
-        elif grep -qsF "$old_line" "$rc"; then
-            tmp="${rc}.aur-insight.$$"
-            sed "s|$old_line|$line|g" "$rc" > "$tmp" && mv "$tmp" "$rc"
-            say "updated hook path in ${c_bold}${rc}${c_off}"
-        else
-            printf '\n# aur-insight paru hook\n%s\n' "$line" >> "$rc"
-            say "added the hook to ${c_bold}${rc}${c_off}"
-        fi
-    done
+    add_hook_to_rcs
     say "open a new shell, or run: ${c_bold}source \"$HOOK_FILE\"${c_off}"
 fi
 
