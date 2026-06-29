@@ -10,6 +10,8 @@ CONFIG_DIR="$HOME/.config/aur-insight"
 CONFIG_FILE="$CONFIG_DIR/config"
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/aur-insight"
 HOOK_FILE="$DATA_DIR/paru-hook.sh"
+FISH_HOOK_FILE="$DATA_DIR/paru-hook.fish"
+FISH_CONF_FILE="$HOME/.config/fish/conf.d/aur-insight.fish"
 
 c_bold=$'\033[1m'; c_cyan=$'\033[36m'; c_dim=$'\033[2m'; c_off=$'\033[0m'
 say() { printf '%saur-insight%s | %s\n' "$c_cyan$c_bold" "$c_off" "$1"; }
@@ -46,6 +48,7 @@ install_files() {
     install -m 755 "$REPO_DIR/aur_insight.py" "$BIN_DIR/aur-insight"
     mkdir -p "$DATA_DIR"
     install -m 644 "$REPO_DIR/paru-hook.sh" "$HOOK_FILE"
+    install -m 644 "$REPO_DIR/paru-hook.fish" "$FISH_HOOK_FILE"
     say "installed paru hook to ${c_bold}${HOOK_FILE}${c_off}"
 }
 
@@ -85,6 +88,12 @@ add_hook_to_rcs() {
     done < <(rc_files)
 }
 
+add_fish_hook() {
+    mkdir -p "$(dirname "$FISH_CONF_FILE")"
+    printf 'source "%s"\n' "$FISH_HOOK_FILE" > "$FISH_CONF_FILE"
+    say "added fish hook to ${c_bold}${FISH_CONF_FILE}${c_off}"
+}
+
 remove_hook_from_rcs() {
     local rc tmp
     while IFS= read -r rc; do
@@ -93,6 +102,8 @@ remove_hook_from_rcs() {
         sed -E '/# aur-insight paru hook/d;/^[[:space:]]*source .*paru-hook[.]sh/d' "$rc" > "$tmp" && mv "$tmp" "$rc"
         say "removed paru hook lines from ${c_bold}${rc}${c_off}"
     done < <(rc_files)
+    rm -f "$FISH_CONF_FILE"
+    say "removed fish hook from ${c_bold}${FISH_CONF_FILE}${c_off}"
 }
 
 purge_config=0
@@ -110,7 +121,7 @@ case "${1:-}" in
         [ "${2:-}" = "--purge-config" ] && purge_config=1
         [ -z "${3:-}" ] || { usage >&2; exit 2; }
         remove_hook_from_rcs
-        rm -f "$BIN_DIR/aur-insight" "$HOOK_FILE"
+        rm -f "$BIN_DIR/aur-insight" "$HOOK_FILE" "$FISH_HOOK_FILE"
         rmdir "$DATA_DIR" 2>/dev/null || true
         say "removed CLI and paru hook"
         if [ "$purge_config" -eq 1 ]; then
@@ -125,8 +136,14 @@ case "${1:-}" in
         [ -z "${2:-}" ] || { usage >&2; exit 2; }
         install_files
         migrate_hook_paths
+        case "${SHELL:-}" in
+            *fish) add_fish_hook ;;
+        esac
         say "upgrade complete; kept existing config at ${c_bold}${CONFIG_FILE}${c_off}"
-        say "open a new shell, or run: ${c_bold}source \"$HOOK_FILE\"${c_off}"
+        case "${SHELL:-}" in
+            *fish) say "open a new shell, or run: ${c_bold}source \"$FISH_HOOK_FILE\"${c_off}" ;;
+            *) say "open a new shell, or run: ${c_bold}source \"$HOOK_FILE\"${c_off}" ;;
+        esac
         exit 0
         ;;
     "")
@@ -185,8 +202,16 @@ echo
 printf 'Run aur-insight automatically on every paru install/upgrade? [y/N]: '
 read -r hook || true
 if [ "${hook:-n}" = "y" ] || [ "${hook:-n}" = "Y" ]; then
-    add_hook_to_rcs
-    say "open a new shell, or run: ${c_bold}source \"$HOOK_FILE\"${c_off}"
+    case "${SHELL:-}" in
+        *fish)
+            add_fish_hook
+            say "open a new shell, or run: ${c_bold}source \"$FISH_HOOK_FILE\"${c_off}"
+            ;;
+        *)
+            add_hook_to_rcs
+            say "open a new shell, or run: ${c_bold}source \"$HOOK_FILE\"${c_off}"
+            ;;
+    esac
 fi
 
 echo
