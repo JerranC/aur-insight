@@ -56,6 +56,23 @@ cd aur-insight
 model slug, and key (stored `0600`), and optionally wires up the paru hook.
 Requires Python 3.6+ and nothing else — standard library only, one file.
 
+Already installed? Upgrade in place without re-entering your API key:
+
+```bash
+git pull
+./setup.sh --upgrade
+exec "$SHELL" -l
+```
+
+To uninstall the CLI and shell hook while keeping your config:
+
+```bash
+./setup.sh --uninstall
+```
+
+Add `--purge-config` to also remove `~/.config/aur-insight` and the local
+cache.
+
 Prefer to do it by hand? It's just:
 
 ```bash
@@ -137,13 +154,15 @@ unchanged packages is instant and free. `--no-cache` forces a fresh call.
 
 ## Run automatically on every paru operation
 
-Source the hook from your shell rc to make reviews happen on their own:
+`setup.sh` can install the hook for you. If you want to wire it manually,
+source the installed hook from your shell rc:
 
 ```bash
-echo 'source /path/to/aur-insight/paru-hook.sh' >> ~/.bashrc   # or ~/.zshrc
+echo 'source ~/.local/share/aur-insight/paru-hook.sh' >> ~/.bashrc   # or ~/.zshrc
 ```
 
-Now `paru -S <pkg>` and `paru -Syu` print an aur-insight verdict **before**
+Open a new shell, then `paru -S <pkg>` and `paru -Syu` print an aur-insight
+review marker/verdict **before**
 paru's own confirmation prompt — you read the verdict, then paru asks you to
 proceed as usual. The hook runs in `--diff` mode: updates are reviewed as a
 diff, fresh installs as a full `--deep` payload review.

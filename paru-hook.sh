@@ -17,7 +17,16 @@
 # Set AUR_INSIGHT_OFF=1 to temporarily disable the hook without unsourcing it.
 # Set AUR_INSIGHT_DEEP=1 to always review the FULL payload (not just the diff).
 
-AUR_INSIGHT_BIN="${AUR_INSIGHT_BIN:-aur-insight}"
+: "${AUR_INSIGHT_BIN:=aur-insight}"
+if [ -z "${AUR_INSIGHT_HOOK_PATH:-}" ]; then
+    if [ -n "${BASH_SOURCE:-}" ]; then
+        AUR_INSIGHT_HOOK_PATH="${BASH_SOURCE[0]}"
+    elif [ -n "${ZSH_VERSION:-}" ]; then
+        AUR_INSIGHT_HOOK_PATH="${(%):-%x}"
+    else
+        AUR_INSIGHT_HOOK_PATH="unknown"
+    fi
+fi
 [ -n "${AUR_INSIGHT_DEEP:-}" ] && AUR_INSIGHT_MODE="--deep" || AUR_INSIGHT_MODE="--diff"
 
 paru() {
@@ -38,8 +47,10 @@ paru() {
     done
 
     if [ "$op" = "upgrade" ]; then
+        printf '\n[aur-insight] reviewing pending AUR updates before paru...\n' >&2
         "$AUR_INSIGHT_BIN" $AUR_INSIGHT_MODE --syu
     elif [ "$op" = "install" ] && [ "${#pkgs[@]}" -gt 0 ]; then
+        printf '\n[aur-insight] reviewing %s before paru...\n' "${pkgs[*]}" >&2
         "$AUR_INSIGHT_BIN" $AUR_INSIGHT_MODE "${pkgs[@]}"
     fi
 
@@ -58,6 +69,7 @@ aur-insight-hook-status() {
     fi
     if type paru 2>/dev/null | grep -q "function"; then
         echo "aur-insight hook: active ($AUR_INSIGHT_MODE, $AUR_INSIGHT_BIN)"
+        echo "aur-insight hook: sourced from ${AUR_INSIGHT_HOOK_PATH:-unknown}"
         return 0
     fi
     echo "aur-insight hook: not active in this shell; source paru-hook.sh"
