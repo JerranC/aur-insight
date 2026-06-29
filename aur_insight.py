@@ -37,7 +37,7 @@ import zipfile
 AUR = "https://aur.archlinux.org"
 RPC = AUR + "/rpc/v5/info"
 CGIT = AUR + "/cgit/aur.git"
-USER_AGENT = "aur-insight/1.0 (+https://atlasinsight.io)"
+USER_AGENT = "aur-insight/1.0 (+https://atlas-insight.com)"
 HTTP_TIMEOUT = 15
 
 CONFIG_PATHS = [
@@ -887,7 +887,7 @@ def render(result, cached=False):
         fc, fmark = FINDING_MARK.get(f["level"], (C.DIM, "-"))
         print("  {0}{1}{2} {3}".format(fc, fmark, C.RESET, f["text"]))
     print()
-    print("{0}Powered by Atlas Insight | atlasinsight.io{1}".format(
+    print("{0}Powered by Atlas Insight | atlas-insight.com{1}".format(
         C.DIM, C.RESET))
 
 

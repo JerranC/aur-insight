@@ -1,7 +1,7 @@
 # aur-insight
 
 **LLM-backed security review for AUR packages — before you install.**
-_Powered by [Atlas Insight](https://atlasinsight.io)_
+_Powered by [Atlas Insight](https://atlas-insight.com)_
 
 AUR package management on Arch is basically a part-time job: every install and
 every `-Syu` is a small act of trust in a stranger's PKGBUILD. `aur-insight`
@@ -25,7 +25,7 @@ Official vendor source, checksums present, hooks limited to standard tasks.
   ✓ Maintainer active; package not orphaned or freshly submitted
   ✓ .install hooks limited to systemctl and update-desktop-database
 
-Powered by Atlas Insight | atlasinsight.io
+Powered by Atlas Insight | atlas-insight.com
 ```
 
 ## What it flags
