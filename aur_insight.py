@@ -14,14 +14,20 @@ MIT licensed.
 
 import argparse
 import calendar
+import hashlib
+import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
 import urllib.parse
 import urllib.request
+import zipfile
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -41,6 +47,29 @@ CONFIG_PATHS = [
 # Cap the size of any single artifact we send to the model. PKGBUILDs are
 # tiny; a malicious diff could be huge, so we trim to stay cheap and bounded.
 MAX_ARTIFACT_CHARS = 12000
+
+CACHE_DIR = os.path.expanduser("~/.cache/aur-insight")
+
+# --- deep (source-payload) analysis limits --------------------------------
+# Downloading attacker-controlled archives demands hard bounds: a capped
+# download, a capped number of extracted files, and per-file/total char caps
+# on what reaches the model. We never write archive members to disk by name
+# (no zip-slip); everything is read in memory.
+MAX_DOWNLOAD_BYTES = 30 * 1024 * 1024      # refuse sources larger than this
+MAX_DEEP_FILES = 25                         # most build files we'll sample
+MAX_DEEP_FILE_CHARS = 4000                  # per-file cap sent to the model
+MAX_DEEP_TOTAL_CHARS = 45000                # total deep payload cap
+
+# Files that actually execute at build/install time — where a backdoor hides
+# in plain sight (the xz-utils pattern lived in build/test scripts, not the C).
+BUILD_FILE_NAMES = (
+    "configure", "configure.ac", "configure.in", "makefile", "makefile.am",
+    "makefile.in", "cmakelists.txt", "meson.build", "build.rs", "setup.py",
+    "setup.cfg", "pyproject.toml", "package.json", "wscript", "build.sh",
+    "install.sh", "postinstall.js", "preinstall.js", "gradlew", "build.gradle",
+    "build.ninja", "snapcraft.yaml", ".pc",
+)
+BUILD_FILE_SUFFIXES = (".sh", ".bash", ".m4", ".mk", ".cmake", ".pre", ".post")
 
 SYSTEM_PROMPT = """\
 You are a security reviewer for Arch Linux AUR packages. You are given the \
@@ -67,6 +96,12 @@ opening network connections, modifying other packages, fetching code.
 - metadata smells: orphaned package (no maintainer), very recently first \
 submitted, or modified in a way inconsistent with an established package.
 - anything structurally wrong for the declared package type.
+- if an "UPSTREAM SOURCE: build/install-time files" section is present, it \
+contains real code from the package's source= payload (not the packaging). \
+Review it for backdoors, obfuscated or base64/hex-encoded blobs, code that \
+phones home, or anything that does not belong in a build script — this is \
+where supply-chain backdoors like xz-utils hide. If that section is ABSENT, \
+do not assume the payload is safe; make clear you reviewed only the packaging.
 
 Be proportionate. Most packages are fine; do not invent danger. A clean, \
 boring PKGBUILD from an official source with present checksums is LOW risk and \
@@ -179,6 +214,34 @@ def http_post_json(url, payload, api_key):
 
 
 # ---------------------------------------------------------------------------
+# Verdict cache — keyed by the exact input, so a new package version (new
+# PKGBUILD/diff/source) misses and re-analyzes, but a repeated -Syu is free.
+# ---------------------------------------------------------------------------
+
+def cache_key(cfg, message):
+    blob = "{0}\n{1}\n{2}".format(cfg["endpoint"], cfg["model"], message)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def cache_get(key):
+    try:
+        with open(os.path.join(CACHE_DIR, key + ".json"), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def cache_put(key, result):
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(os.path.join(CACHE_DIR, key + ".json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(result, f)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # AUR data gathering
 # ---------------------------------------------------------------------------
 
@@ -222,6 +285,221 @@ def find_install_files(pkgbuild, pkgbase):
     return [n for n in names if n and "$" not in n]
 
 
+def pkgbuild_vars(pkgbuild, pkgbase, meta):
+    """Best-effort map of the variables that show up in source= entries."""
+    vmap = {"pkgbase": pkgbase}
+    pm = re.search(r"^\s*pkgname\s*=\s*([^\s#()]+)", pkgbuild, re.M)
+    if pm:
+        vmap["pkgname"] = pm.group(1).strip("'\"")
+    pv = re.search(r"^\s*pkgver\s*=\s*([^\s#]+)", pkgbuild, re.M)
+    if pv:
+        vmap["pkgver"] = pv.group(1).strip("'\"")
+    elif meta.get("Version"):
+        vmap["pkgver"] = str(meta["Version"]).rsplit("-", 1)[0]
+    # Capture simple `_foo=bar` custom vars (common: _gitcommit, _pkgver).
+    for m in re.finditer(r"^\s*(_[\w]+)\s*=\s*([^\s#()]+)", pkgbuild, re.M):
+        vmap[m.group(1)] = m.group(2).strip("'\"")
+    return vmap
+
+
+def expand_vars(token, vmap):
+    """Resolve $var / ${var} and the common bash substitutions ${var//a/b}
+    (replace all) and ${var/a/b} (replace first) seen in source= URLs."""
+    def repl(m):
+        expr = m.group(1)
+        sub = re.match(r"(\w+)//(.*?)/(.*)$", expr)
+        if sub and vmap.get(sub.group(1)):
+            return vmap[sub.group(1)].replace(sub.group(2), sub.group(3))
+        sub = re.match(r"(\w+)/(.*?)/(.*)$", expr)
+        if sub and vmap.get(sub.group(1)):
+            return vmap[sub.group(1)].replace(sub.group(2), sub.group(3), 1)
+        return vmap.get(expr, m.group(0))
+
+    token = re.sub(r"\$\{([^}]+)\}", repl, token)
+    for var, val in vmap.items():
+        if val:
+            token = token.replace("$" + var, val)
+    return token
+
+
+def parse_sources(pkgbuild, vmap):
+    """Parse every source=/source_arch=() entry into classified records:
+    {raw, name, url, local, vcs, frag, resolved}. `url` is set for remote
+    sources, `local` for files shipped in the AUR repo."""
+    entries = []
+    for m in re.finditer(r"^\s*source(?:_\w+)?\s*=\s*\((.*?)\)",
+                         pkgbuild, re.S | re.M):
+        for tok in re.findall(r"'([^']*)'|\"([^\"]*)\"|(\S+)", m.group(1)):
+            raw = (tok[0] or tok[1] or tok[2]).strip()
+            if raw:
+                entries.append(_classify_source(raw, vmap))
+    return entries
+
+
+def _classify_source(raw, vmap):
+    name, spec = None, raw
+    if "::" in spec:
+        name, spec = spec.split("::", 1)
+    frag = ""
+    if "#" in spec:
+        spec, frag = spec.split("#", 1)
+    vcs = None
+    for proto in ("git+", "hg+", "svn+", "bzr+"):
+        if spec.startswith(proto):
+            vcs, spec = proto[:-1], spec[len(proto):]
+            break
+    resolved = expand_vars(spec, vmap)
+    is_remote = bool(vcs) or re.match(r"(https?|ftp|git)://", resolved)
+    return {
+        "raw": raw, "name": name and expand_vars(name, vmap),
+        "url": resolved if is_remote else None,
+        "local": None if is_remote else resolved,
+        "vcs": vcs, "frag": expand_vars(frag, vmap),
+        "unresolved": "$" in resolved,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Deep (source-payload) analysis — the actual upstream code, not just packaging
+# ---------------------------------------------------------------------------
+
+def _is_build_file(path):
+    """True for files that execute during build/install — the real hiding
+    place for supply-chain payloads (xz-utils lived in build/test scripts)."""
+    base = path.rsplit("/", 1)[-1].lower()
+    return base in BUILD_FILE_NAMES or base.endswith(BUILD_FILE_SUFFIXES)
+
+
+def _looks_text(blob):
+    return b"\x00" not in blob[:4096]
+
+
+def _download_capped(url):
+    """Download up to MAX_DOWNLOAD_BYTES; refuse (None) anything larger so a
+    decompression-bomb or giant blob can't run us out of memory."""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            blob = resp.read(MAX_DOWNLOAD_BYTES + 1)
+    except Exception:
+        return None
+    return None if len(blob) > MAX_DOWNLOAD_BYTES else blob
+
+
+def _read_archive(blob):
+    """Read regular files out of a tar (gz/bz2/xz) or zip archive entirely in
+    memory. Never writes to disk, so archive member names can't traverse paths.
+    Returns [(path, bytes)]; empty for formats stdlib can't open (e.g. .zst)."""
+    out = []
+    cap = MAX_DEEP_FILE_CHARS * 6
+    try:
+        tf = tarfile.open(fileobj=io.BytesIO(blob), mode="r:*")
+        for m in tf.getmembers():
+            if m.isfile() and m.size <= cap * 4:
+                fh = tf.extractfile(m)
+                if fh:
+                    out.append((m.name, fh.read(cap)))
+            if len(out) > 3000:
+                break
+        return out
+    except (tarfile.TarError, EOFError, OSError):
+        pass
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(blob))
+        for info in zf.infolist():
+            if not info.is_dir() and info.file_size <= cap * 4:
+                with zf.open(info) as fh:
+                    out.append((info.filename, fh.read(cap)))
+            if len(out) > 3000:
+                break
+    except (zipfile.BadZipFile, OSError):
+        pass
+    return out
+
+
+def _git_sample(url, frag):
+    """Shallow-clone a git source into a temp dir, read its files, clean up.
+    Returns ([(path, bytes)], error_or_None)."""
+    if not shutil.which("git"):
+        return [], "git not installed (needed for git+ sources)"
+    tmp = tempfile.mkdtemp(prefix="aur-insight-")
+    try:
+        cmd = ["git", "clone", "--depth", "1", "--quiet"]
+        m = re.match(r"(tag|branch)=(.+)", frag or "")
+        if m:
+            cmd += ["--branch", m.group(2)]
+        cmd += [url, tmp]
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=120)
+        except subprocess.SubprocessError:
+            return [], "clone timed out"
+        if r.returncode != 0:
+            return [], "clone failed"
+        files, cap = [], MAX_DEEP_FILE_CHARS * 6
+        for root, dirs, names in os.walk(tmp):
+            if ".git" in dirs:
+                dirs.remove(".git")
+            for fn in names:
+                path = os.path.join(root, fn)
+                try:
+                    if os.path.getsize(path) > cap * 4:
+                        continue
+                    with open(path, "rb") as fh:
+                        files.append((os.path.relpath(path, tmp), fh.read(cap)))
+                except OSError:
+                    continue
+        return files, None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def deep_source_analysis(pkgbuild, pkgbase, meta):
+    """Fetch the real upstream source the PKGBUILD downloads and sample the
+    build-time-executed files for the model. Returns (artifact, notes, count).
+    This is what lets aur-insight reason about a clean PKGBUILD that pulls in
+    malicious code — but it costs bandwidth and tokens, so it's opt-in."""
+    vmap = pkgbuild_vars(pkgbuild, pkgbase, meta)
+    candidates, notes = [], []
+    for s in parse_sources(pkgbuild, vmap):
+        if not s["url"]:
+            continue  # local files are already included as repo extras
+        label = s["name"] or s["url"].rsplit("/", 1)[-1] or s["url"]
+        if s["unresolved"]:
+            notes.append("unresolved source URL, skipped: " + s["raw"])
+            continue
+        if s["vcs"] == "git":
+            files, err = _git_sample(s["url"], s["frag"])
+            if s["frag"].startswith("commit="):
+                notes.append("{0}: pinned to {1}; shallow clone is HEAD, may "
+                             "differ".format(label, s["frag"]))
+        elif s["vcs"]:
+            files, err = [], "{0} sources not supported in --deep".format(s["vcs"])
+        else:
+            blob = _download_capped(s["url"])
+            if blob is None:
+                files, err = [], "download failed or over {0}MB cap".format(
+                    MAX_DOWNLOAD_BYTES // 1024 // 1024)
+            else:
+                files = _read_archive(blob)
+                err = ("archive not readable by stdlib (e.g. .zst), skipped"
+                       if not files else None)
+        if err:
+            notes.append("{0}: {1}".format(label, err))
+        for path, blob in files:
+            candidates.append((label, path, blob))
+
+    picked, total = [], 0
+    for label, path, blob in sorted(candidates, key=lambda c: c[1].count("/")):
+        if len(picked) >= MAX_DEEP_FILES or total >= MAX_DEEP_TOTAL_CHARS:
+            break
+        if not _is_build_file(path) or not _looks_text(blob):
+            continue
+        text = blob.decode("utf-8", "replace")[:MAX_DEEP_FILE_CHARS]
+        picked.append("--- {0} :: {1} ---\n{2}".format(label, path, text))
+        total += len(text)
+    return "\n\n".join(picked), notes, len(picked)
+
+
 def fetch_history(pkgbase):
     """Recent commits to the AUR packaging repo, newest first, from the cgit
     atom feed. Each entry is {author, date, title}. Drives ownership-transfer
@@ -260,9 +538,10 @@ def fetch_account_age(username):
     return m.group(1) if m else None
 
 
-def gather(pkgname):
+def gather(pkgname, deep=False):
     """Collect everything we know about a package. Returns a dict or None
-    if the package doesn't exist on the AUR."""
+    if the package doesn't exist on the AUR. With deep=True, also downloads
+    and samples the real upstream source payload."""
     meta = fetch_metadata(pkgname)
     if meta is None:
         return None
@@ -275,8 +554,23 @@ def gather(pkgname):
         if body:
             installs[name] = body
 
-    diff = http_get("{0}/patch/?h={1}".format(
-        CGIT, urllib.parse.quote(pkgbase)))
+    # Local files shipped in the AUR repo (patches, .sh, .service...) are cheap
+    # to fetch and high-signal — a malicious .patch is a classic vector.
+    extras, vmap = {}, pkgbuild_vars(pkgbuild, pkgbase, meta)
+    for s in parse_sources(pkgbuild, vmap):
+        name = s["local"]
+        if (name and name not in installs and "/" not in name
+                and "$" not in name and len(extras) < 12):
+            body = cgit_plain(pkgbase, name)
+            if body and _looks_text(body.encode("utf-8", "replace")):
+                extras[name] = body
+
+    diff = http_get("{0}/patch/?h={1}".format(CGIT, urllib.parse.quote(pkgbase)))
+
+    deep_artifact, deep_notes, deep_count = "", [], 0
+    if deep:
+        deep_artifact, deep_notes, deep_count = deep_source_analysis(
+            pkgbuild, pkgbase, meta)
 
     return {
         "name": pkgname,
@@ -284,9 +578,13 @@ def gather(pkgname):
         "meta": meta,
         "pkgbuild": pkgbuild,
         "installs": installs,
+        "extras": extras,
         "diff": diff or "",
         "history": fetch_history(pkgbase),
         "account_age": fetch_account_age(meta.get("Maintainer")),
+        "deep_artifact": deep_artifact,
+        "deep_notes": deep_notes,
+        "deep_count": deep_count,
     }
 
 
@@ -375,8 +673,22 @@ def build_user_message(data, is_update):
     else:
         parts.append("\n== INSTALL HOOKS ==\n(none)")
 
+    for name, body in data.get("extras", {}).items():
+        parts.append("\n== REPO FILE: {0} ==\n{1}".format(name, trim(body)))
+
     if is_update and data["diff"]:
-        parts.append("\n== MOST RECENT GIT DIFF ==\n" + trim(data["diff"]))
+        parts.append("\n== MOST RECENT PACKAGING DIFF ==\n" + trim(data["diff"]))
+
+    if data.get("deep_artifact"):
+        parts.append(
+            "\n== UPSTREAM SOURCE: build/install-time files ({0} sampled) ==\n"
+            "These are pulled from the actual source= payload, not the "
+            "packaging. Scrutinize for backdoors, obfuscation, or network "
+            "calls hidden in build scripts.\n{1}".format(
+                data["deep_count"], data["deep_artifact"]))
+    if data.get("deep_notes"):
+        parts.append("\n== UPSTREAM SOURCE NOTES ==\n- "
+                     + "\n- ".join(data["deep_notes"]))
 
     return "\n".join(parts)
 
@@ -447,12 +759,13 @@ FINDING_MARK = {
 }
 
 
-def render(result):
+def render(result, cached=False):
     color, label, mark = VERDICT_STYLE.get(result["verdict"],
                                            VERDICT_STYLE["UNKNOWN"])
     print()
-    print("{0}{1}VERDICT: {2} {3}{4}".format(
-        C.BOLD, color, label, mark, C.RESET))
+    tag = "  {0}(cached){1}".format(C.DIM, C.RESET) if cached else ""
+    print("{0}{1}VERDICT: {2} {3}{4}{5}".format(
+        C.BOLD, color, label, mark, C.RESET, tag))
     if result["summary"]:
         print("{0}{1}{2}".format(C.DIM, result["summary"], C.RESET))
     print()
@@ -468,10 +781,11 @@ def render(result):
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def analyze_one(cfg, pkgname, is_update=False):
+def analyze_one(cfg, pkgname, is_update=False, deep=False, use_cache=True):
     """Returns the verdict string, or None if the package wasn't analyzable."""
-    banner("analyzing {0}{1}{2}...".format(C.BOLD, pkgname, C.RESET))
-    data = gather(pkgname)
+    suffix = " {0}(deep){1}".format(C.DIM, C.RESET) if deep else ""
+    banner("analyzing {0}{1}{2}...{3}".format(C.BOLD, pkgname, C.RESET, suffix))
+    data = gather(pkgname, deep=deep)
     if data is None:
         print("  {0}not found on the AUR — skipping (is it a repo package?)"
               "{1}".format(C.YELLOW, C.RESET))
@@ -482,12 +796,17 @@ def analyze_one(cfg, pkgname, is_update=False):
         return None
 
     message = build_user_message(data, is_update)
-    try:
-        content = analyze_with_llm(cfg, message)
-    except Exception as exc:  # network / auth / endpoint errors
-        die("LLM request failed: {0}".format(exc))
-    result = parse_verdict(content)
-    render(result)
+    key = cache_key(cfg, message)
+    result = cache_get(key) if use_cache else None
+    cached = result is not None
+    if result is None:
+        try:
+            content = analyze_with_llm(cfg, message)
+        except Exception as exc:  # network / auth / endpoint errors
+            die("LLM request failed: {0}".format(exc))
+        result = parse_verdict(content)
+        cache_put(key, result)
+    render(result, cached=cached)
     return result["verdict"]
 
 
@@ -530,13 +849,18 @@ def main(argv=None):
                         help="treat targets as updates (include recent git diff)")
     parser.add_argument("--install", action="store_true",
                         help="after analysis, offer to run `paru -S <pkg>`")
+    parser.add_argument("--deep", action="store_true",
+                        help="also download and review the upstream source "
+                             "payload, not just the packaging (slower, more tokens)")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="ignore any cached verdict and re-analyze")
     parser.add_argument("--dry-run", action="store_true",
                         help="print what would be sent to the LLM, then stop")
     args = parser.parse_args(argv)
 
     if args.dry_run:
         for pkg in (pending_aur_updates() if args.syu else args.packages):
-            data = gather(pkg)
+            data = gather(pkg, deep=args.deep)
             if data is None:
                 print("# {0}: not on the AUR".format(pkg))
                 continue
@@ -567,7 +891,8 @@ def main(argv=None):
 
     verdicts = {}
     for pkg in targets:
-        verdicts[pkg] = analyze_one(cfg, pkg, is_update=is_update)
+        verdicts[pkg] = analyze_one(cfg, pkg, is_update=is_update,
+                                    deep=args.deep, use_cache=not args.no_cache)
         print()
 
     if args.install and targets:

@@ -90,15 +90,39 @@ export AUR_INSIGHT_MODEL=gpt-4o-mini
 ## Use
 
 ```bash
-aur-insight firefox-nightly          # review one package
+aur-insight firefox-nightly          # review one package's packaging
 aur-insight pkg-a pkg-b pkg-c        # review several
 aur-insight --syu                    # review every pending AUR update (uses paru -Qua)
+aur-insight --deep firefox-nightly   # ALSO download and review the upstream source payload
 aur-insight --install foo            # review, then offer to run `paru -S foo`
 aur-insight --dry-run foo            # show exactly what would be sent to the LLM, spend nothing
+aur-insight --no-cache foo           # ignore the cached verdict and re-analyze
 ```
 
 Exit code is `1` if anything came back **HIGH RISK**, `0` otherwise — handy for
 scripts and hooks.
+
+### Two depths of review
+
+| Mode             | Reads                                                        | Catches                                              |
+|------------------|-------------------------------------------------------------|-----------------------------------------------------|
+| default          | PKGBUILD, `.install` hooks, repo files (patches), metadata  | malicious **packaging** — bad maintainer, evil hooks |
+| `--deep`         | all of the above **+ the real `source=` payload's build/install scripts** | malicious **code** in a clean-looking package (the xz-utils pattern) |
+
+`--deep` downloads each source, reads it **in memory** (no extraction to disk,
+so a hostile archive can't traverse paths), and samples the files that actually
+execute at build/install time — `configure`, `Makefile`, `*.sh`, `setup.py`,
+`package.json`, `build.rs`, and friends — where supply-chain backdoors hide.
+It's bounded hard: a 30 MB download cap, 25 files, ~45 KB of code to the model.
+Archives stdlib can't open (e.g. `.zst`) and `hg`/`svn`/`bzr` sources are
+skipped with a note rather than silently ignored.
+
+### Caching
+
+Verdicts are cached under `~/.cache/aur-insight/`, keyed by the **exact**
+input (endpoint + model + every artifact). A new package version changes the
+PKGBUILD/diff/source, so it misses and re-analyzes; a repeated `-Syu` over
+unchanged packages is instant and free. `--no-cache` forces a fresh call.
 
 ## Run automatically on every paru operation
 
@@ -125,13 +149,16 @@ proceed as usual. Toggle it off any time with `export AUR_INSIGHT_OFF=1`.
   page is auth-gated). Set `AUR_INSIGHT_COOKIE` to your AUR session cookie to
   enable it; otherwise aur-insight falls back to "how long this maintainer has
   been committing to this package." It never invents data it can't fetch.
-- **What it does _not_ inspect yet:** the actual upstream source the PKGBUILD
-  downloads (`source=`). A clean PKGBUILD that pulls a malicious tarball or git
-  commit — the xz-utils pattern — is **not** caught by v1. Reviewing the
-  payload (source-diff analysis for source packages, binary analysis for
-  `-bin` packages) is the headline item on the roadmap, not a shipped feature.
-  Don't read a LOW verdict as "the code is safe" — read it as "the packaging
-  is clean."
+- **Source payload:** `--deep` reviews the build/install-time scripts inside
+  the actual `source=` download — that's the fix for "clean PKGBUILD, malicious
+  code." It is **not** exhaustive: it samples build-relevant text files within
+  hard caps, so a backdoor buried in compiled output, a `.zst` archive, or a
+  giant source tree can still slip past. A clean `--deep` verdict means "nothing
+  obviously wrong in the packaging or the build scripts we sampled," not "this
+  code is proven safe."
+- **Still out of scope:** binary analysis of `-bin` packages, non-AUR
+  packages, and per-version source *diffing* (only the current payload is
+  reviewed today, not the delta from the version you already trust).
 - It's an assistant, not an authority. A clean verdict is not a guarantee, and
   the final call is always yours.
 
