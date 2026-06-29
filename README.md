@@ -96,7 +96,8 @@ aur-insight --syu                    # review every pending AUR update (uses par
 aur-insight --deep firefox-nightly   # ALSO download and review the upstream source payload
 aur-insight --diff --syu             # for updates: review ONLY what changed since installed
 aur-insight --install foo            # review, then offer to run `paru -S foo`
-aur-insight --dry-run foo            # show exactly what would be sent to the LLM, spend nothing
+aur-insight --dry-run foo            # compact preview, spend nothing
+aur-insight --dump-prompt foo        # print the full raw LLM prompt
 aur-insight --no-cache foo           # ignore the cached verdict and re-analyze
 ```
 
@@ -150,6 +151,7 @@ diff, fresh installs as a full `--deep` payload review.
 - `export AUR_INSIGHT_OFF=1` — temporarily disable the hook.
 - `export AUR_INSIGHT_DEEP=1` — review the **full** payload every time instead
   of just the diff (slower, more tokens, more thorough).
+- `aur-insight-hook-status` — verify that the shell function is active.
 
 ## Privacy & scope
 
