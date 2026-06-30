@@ -209,6 +209,20 @@ source ~/.local/share/aur-insight/paru-hook.fish
 - It's an assistant, not an authority. A clean verdict is not a guarantee, and
   the final call is always yours.
 
+## Advisory use / no warranty
+
+aur-insight is an advisory review tool. It can be incomplete, incorrect, or
+misleading, including both false positives and false negatives. A LOW RISK
+verdict does **not** mean a package is proven safe, and a HIGH RISK verdict does
+**not** prove a package is malicious.
+
+You are responsible for deciding whether to build, install, update, remove, or
+trust any package. aur-insight does not replace reading the PKGBUILD, install
+hooks, upstream source, maintainer history, or any other relevant material.
+
+The project is provided under the MIT License, including its "AS IS" warranty
+and liability disclaimer. See [LICENSE](LICENSE).
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
